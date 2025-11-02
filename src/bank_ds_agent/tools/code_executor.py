@@ -2,154 +2,231 @@ import docker
 import jupyter_client
 import time
 import os
+import json
+import tempfile
+import shutil
 import atexit
-import base64
+import re  # <-- 确保 re 被导入
 from queue import Empty
+import docker.errors  # <-- 确保 docker.errors 被导入
 
 
 class SandboxJupyterExecutor:
     """
-    一个使用 Docker 容器作为安全沙箱，并在容器内运行 Jupyter 内核的工具。
-    它保持了状态，同时提供了安全隔离。
+    一个有状态的、沙箱化的 Jupyter 执行器。（来自您的优秀参考）
+
+    它通过 Docker 启动一个 Jupyter 内核容器，并使用 jupyter_client
+    通过 TCP 端口（9000-9004）连接到它。
     """
 
-    def __init__(self, image_name="bank-agent-kernel"):
-        print("正在初始化 Docker 沙箱...")
+    def __init__(self, image_name="agent-executor:latest", timeout=20):
+        print(f"Initializing SandboxJupyterExecutor with image {image_name}...")
         self.client = docker.from_env()
         self.image_name = image_name
         self.container = None
-        self.kernel_client = None
-        self.connection_file_path = "temp_kernel.json"
+        self.km = None
 
-        # 启动容器和内核
-        self._start_container_and_kernel()
+        # 解决方案 1：使用临时目录进行卷挂载
+        self.kernel_dir = tempfile.mkdtemp(prefix="agent_kernel_")
+        self.kernel_json_path = os.path.join(self.kernel_dir, "kernel.json")
 
-        # 确保在程序退出时清理容器
-        atexit.register(self.close)
-        print("Docker 沙箱内核已连接并准备就绪。")
+        # 端口必须与 Dockerfile.agent 中的 CMD 匹配
+        self.ports = {f"{p}/tcp": p for p in range(9000, 9005)}
 
-    def _start_container_and_kernel(self):
         try:
-            # 1. 启动 Docker 容器
-            print(f"正在从镜像启动容器: {self.image_name}")
+            # 启动容器
+            print(f"Starting container from image {self.image_name}...")
             self.container = self.client.containers.run(
-                self.image_name,
-                detach=True,  # 后台运行
-                ports={"8888/tcp": 8888},  # (可选) 映射一个端口
-                # (关键) 将容器内的 /app 目录挂载到本地，以便获取 kernel.json
-                volumes={os.path.abspath("."): {"bind": "/app", "mode": "rw"}},
+                image=self.image_name,
+                detach=True,
+                ports=self.ports,
+                volumes={self.kernel_dir: {"bind": "/app", "mode": "rw"}},
+                auto_remove=False,  # 我们将在 cleanup() 中手动删除
+                publish_all_ports=False,
             )
 
-            # 2. 等待 kernel.json 文件被创建
-            # (容器内的 CMD 会创建 /app/kernel.json，它会出现在我们的本地目录中)
-            print("等待内核启动并创建 kernel.json...")
-            while not os.path.exists(self.connection_file_path):
+            # 解决方案 2：等待 kernel.json 文件出现
+            print(f"Waiting for kernel.json to appear at {self.kernel_json_path}...")
+            start_time = time.time()
+            while not os.path.exists(self.kernel_json_path):
+                if time.time() - start_time > timeout:
+                    raise TimeoutError("Kernel failed to start and write kernel.json")
                 time.sleep(0.1)
+
+                # 检查容器是否意外退出
+                self.container.reload()
                 if self.container.status == "exited":
-                    raise Exception("容器意外退出，请检查 Docker 日志。")
+                    logs = self.container.logs().decode("utf-8")
+                    raise RuntimeError(f"Container exited unexpectedly. Logs:\n{logs}")
 
-            print("kernel.json 已找到。")
+            print("kernel.json found. Patching IP address...")
 
-            # 3. (关键) 修改连接文件以正确定位
-            # kernel.json 内部的 IP 是容器的 IP (例如 172.x.x.x)，
-            # 我们需要将其替换为 'localhost'，因为 Docker Desktop 会为我们映射端口。
-            # (注意：这是一个简化的实现。在生产中，这需要更复杂的网络处理)
-            # **更新：** 更简单的方法是让 jupyter_client 帮我们处理。
+            # 解决方案 3：修补 kernel.json
+            with open(self.kernel_json_path, "r+") as f:
+                config = json.load(f)
+                config["ip"] = "127.0.0.1"
+                f.seek(0)
+                json.dump(config, f)
+                f.truncate()
 
-            # 4. 加载连接文件并启动客户端
-            self.kernel_client = jupyter_client.BlockingKernelClient(
-                connection_file=self.connection_file_path
-            )
-            self.kernel_client.load_connection_file()
+            print("Connecting jupyter_client...")
+            self.km = jupyter_client.BlockingKernelClient()
+            self.km.load_connection_file(self.kernel_json_path)
+            self.km.start_channels()
 
-            # (这是 Docker 网络的魔法)
-            # 我们告诉客户端，内核的 IP 不是文件里写的那个 (容器IP)
-            # 而是 'localhost' (127.0.0.1)
-            self.kernel_client.ip = "127.0.0.1"
+            # 解决方案 4：健壮的连接握手
+            try:
+                print("Testing kernel connection (wait_for_ready)...")
+                self.km.wait_for_ready(timeout=timeout)
+                print("Kernel is alive and ready!")
+            except RuntimeError as e:
+                print(f"Kernel connection test failed: {e}")
+                print("This is often a FIREWALL or ANTIVIRUS issue.")
+                print("---!!!--- Retrieving container logs for debugging ---!!!---")
+                try:
+                    self.container.reload()
+                    logs = self.container.logs().decode("utf-8")
+                    print(f"Container '{self.container.short_id}' logs:\n{logs}")
+                except Exception as log_e:
+                    print(f"Failed to retrieve container logs: {log_e}")
+                self.cleanup()
+                raise
 
-            self.kernel_client.start_channels()
-
-            # 测试连接
-            self.kernel_client.wait_for_ready(timeout=60)
-            print("内核连接测试通过。")
+            atexit.register(self.cleanup)
 
         except Exception as e:
-            print(f"启动沙箱时出错: {e}")
-            self.close()  # 失败时清理
+            print(f"Error during initialization: {e}")
+            if self.container:
+                print("---!!!--- Retrieving container logs for debugging ---!!!---")
+                try:
+                    self.container.reload()
+                    logs = self.container.logs().decode("utf-8")
+                    print(f"Container '{self.container.short_id}' logs:\n{logs}")
+                except Exception as log_e:
+                    print(f"Failed to retrieve container logs: {log_e}")
+            self.cleanup()  # 确保在失败时清理
             raise
 
-    def run_code(self, code_string: str):
-        """在沙箱内核中执行代码并返回所有输出。"""
-        if not self.kernel_client:
-            raise Exception("内核未连接。")
+    def execute(self, code, timeout=10):
+        """
+        在沙箱化、有状态的内核中执行代码。
+        """
+        if not self.km:
+            raise RuntimeError("Executor is not initialized or has been cleaned up.")
 
-        print(
-            f"\n--- [沙箱Jupyter] 正在执行: ---\n{code_string}\n-----------------------------"
-        )
+        print(f"\n[Executing Code]:\n{code}\n")
+        msg_id = self.km.execute(code)
+        outputs = []
 
-        msg_id = self.kernel_client.execute(code_string)
+        try:
+            # 2. 等待 shell 通道的最终执行回复
+            reply = self.km.get_shell_msg(timeout=timeout)
 
-        outputs = {"stdout": "", "stderr": "", "images": []}  # 存储 base64 编码的图片
+            if reply["content"]["status"] == "error":
+                error_content = reply["content"]
+                traceback = "\n".join(error_content.get("traceback", []))
+                # (清理 ANSI 颜色代码)
+                traceback = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", traceback)
+                outputs.append(
+                    f"[Error] {error_content.get('ename', 'UnknownError')}: {error_content.get('evalue', '')}\n{traceback}"
+                )
 
+        except Empty:
+            return f"[Error] Timeout: Code execution took too long (> {timeout}s)."
+        except Exception as e:
+            return f"[Error] Failed to get shell reply: {e}"
+
+        # 3. 排空 IOPub 通道
         while True:
             try:
-                msg = self.kernel_client.get_iopub_msg(timeout=5)  # 增加超时
-
-                if msg["parent_header"].get("msg_id") == msg_id:
-                    msg_type = msg["header"]["msg_type"]
-
-                    if msg_type == "stream":
-                        if msg["content"]["name"] == "stdout":
-                            outputs["stdout"] += msg["content"]["text"]
-                        else:
-                            outputs["stderr"] += msg["content"]["text"]
-
-                    elif msg_type == "display_data":
-                        if "image/png" in msg["content"]["data"]:
-                            img_b64 = msg["content"]["data"]["image/png"]
-                            outputs["images"].append(img_b64)
-
-                    elif msg_type == "error":
-                        outputs[
-                            "stderr"
-                        ] += f"{msg['content']['ename']}: {msg['content']['evalue']}\n"
-
-                    elif msg_type == "execute_reply":
-                        if msg["content"]["status"] == "error":
-                            outputs[
-                                "stderr"
-                            ] += f"{msg['content']['ename']}: {msg['content']['evalue']}\n"
-                        break
-
+                msg = self.km.get_iopub_msg(timeout=0.2)
             except Empty:
-                print("[沙箱Jupyter] 消息通道超时，假定执行完毕。")
                 break
 
-        print(f"[沙箱Jupyter] Stdout: {outputs['stdout'][:100]}...")
-        print(f"[沙箱Jupyter] Stderr: {outputs['stderr']}")
-        print(f"[沙箱Jupyter] 捕获图像: {len(outputs['images'])}")
-        return outputs
+            if msg["parent_header"].get("msg_id") != msg_id:
+                continue
 
-    def close(self):
-        """关闭客户端、内核并销毁 Docker 容器"""
-        print("\n--- [沙箱Jupyter] 正在关闭 ---")
+            msg_type = msg["header"]["msg_type"]
+            content = msg["content"]
 
-        # 1. 清理本地连接文件
-        if os.path.exists(self.connection_file_path):
-            os.remove(self.connection_file_path)
+            if msg_type == "stream":
+                outputs.append(f"[{content['name']}] {content['text']}")
+            elif msg_type == "display_data":
+                outputs.append(
+                    f"[Display] {content['data'].get('text/plain', 'No plain text representation')}"
+                )
+            elif msg_type == "execute_result":
+                outputs.append(
+                    f"[Result] {content['data'].get('text/plain', 'No plain text representation')}"
+                )
+            elif msg_type == "error":
+                traceback = "\n".join(content.get("traceback", []))
+                traceback = re.sub(r"\x1B\[[0-?]*[ -/]*[@-~]", "", traceback)
+                outputs.append(
+                    f"[Error] {content.get('ename', 'UnknownError')}: {content.get('evalue', '')}\n{traceback}"
+                )
 
-        # 2. 关闭客户端
-        if self.kernel_client:
-            self.kernel_client.stop_channels()
-            self.kernel_client = None
+        result = "\n".join(outputs)
+        print(f"[Execution Result]:\n{result}")
+        return result
 
-        # 3. 停止并移除 Docker 容器
-        if self.container:
-            print(f"正在停止和移除容器: {self.container.id[:12]}...")
-            try:
+    def cleanup(self):
+        """
+        停止内核、停止容器并删除临时目录。
+        """
+        print("\nCleaning up resources...")
+        try:
+            if self.km and self.km.is_alive():
+                print("Shutting down kernel...")
+                self.km.shutdown()
+        except Exception as e:
+            print(f"Error shutting down kernel: {e}")
+
+        try:
+            if self.container:
+                print(f"Stopping container {self.container.short_id}...")
                 self.container.stop()
+                print("Container stopped.")
+                print(f"Removing container {self.container.short_id}...")
                 self.container.remove()
-                print("容器已销毁。")
-            except Exception as e:
-                print(f"关闭容器时出错: {e}")  # (可能它已经停止了)
-            self.container = None
+                print("Container removed.")
+        except docker.errors.NotFound:
+            print("Container already stopped or removed.")
+        except Exception as e:
+            print(f"Error stopping/removing container: {e}")
+
+        try:
+            if self.kernel_dir and os.path.exists(self.kernel_dir):
+                print(f"Removing temp directory {self.kernel_dir}...")
+                shutil.rmtree(self.kernel_dir)
+                print("Temp directory removed.")
+        except Exception as e:
+            print(f"Error removing temp directory: {e}")
+
+        self.km = None
+        self.container = None
+
+
+def build_docker_image(
+    image_tag="agent-executor:latest", build_context_path="."
+):  # <-- 1. 添加参数
+    """
+    自动构建 Docker 镜像。
+    """
+    print(f"Building Docker image '{image_tag}' from Dockerfile.agent...")
+    try:
+        client = docker.from_env()
+        image, logs = client.images.build(
+            path=build_context_path,  # <-- 2. 使用该参数
+            dockerfile="Dockerfile.agent",
+            tag=image_tag,
+            rm=True,
+        )
+        print("Docker image built successfully.")
+        return image
+    except Exception as e:
+        print(f"Failed to build Docker image: {e}")
+        print(
+            "Please ensure Docker is running and Dockerfile.agent is in the same directory."
+        )
+        raise

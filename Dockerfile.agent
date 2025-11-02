@@ -1,5 +1,5 @@
 # 1. 使用一个基础的 Python 镜像
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # 2. 设置工作目录
 WORKDIR /app
@@ -13,11 +13,23 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir jupyter_client ipykernel \
-    pandas scikit-learn matplotlib shap fairlearn
+    pandas scikit-learn matplotlib shap fairlearn dill
 
-# 4. (关键) 当容器启动时，自动启动一个 Jupyter 内核
-#    - 它会将连接文件 'kernel.json' 创建在 /app 目录
-#    - 它会监听来自所有 IP (0.0.0.0) 的连接，而不仅仅是 localhost
+# 4. 暴露文档所需的端口
+EXPOSE 9000-9004
+
+# 5. 启动内核
+# -f /app/kernel.json: 将连接文件写入挂载的卷中
+# --ip=0.0.0.0: 在容器内部绑定所有接口，以便 Docker 端口映射可以工作
+#
+# ---!!! 关键修复 !!!---
+# 使用 IPKernelApp.port_name 格式来正确固定端口。
+# 之前的 --shell_port=9000 是错误的别名。
 CMD ["python", "-m", "ipykernel_launcher", \
      "-f", "/app/kernel.json", \
-     "--ip=0.0.0.0"]
+     "--ip=0.0.0.0", \
+     "--IPKernelApp.shell_port=9000", \
+     "--IPKernelApp.iopub_port=9001", \
+     "--IPKernelApp.stdin_port=9002", \
+     "--IPKernelApp.hb_port=9003", \
+     "--IPKernelApp.control_port=9004"]
